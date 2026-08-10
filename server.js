@@ -6,7 +6,15 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 const app = express();
 const transports = new Map();
 
-// 【核心修复】将 Server 初始化封装，确保每个连接都是独立的实例，防止重连崩溃
+// 1. 添加 CORS 跨域放行头 (防止 App 底层 WebView 拦截)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
 function createMcpServer() {
   const mcpServer = new Server(
     { name: 'universal-http-client', version: '1.0.0' },
@@ -16,14 +24,14 @@ function createMcpServer() {
   mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [{
       name: 'send_request',
-      description: '发送 HTTP 请求(支持 GET/POST)。用于绕过客户端 JSON 解析 Bug，body 必须作为纯字符串传入。',
+      description: '发送 HTTP 请求。用于绕过 JSON 解析 Bug，body 必须为纯字符串。',
       inputSchema: {
         type: 'object',
         properties: {
           url: { type: 'string' },
           method: { type: 'string' },
-          headers: { type: 'string', description: 'JSON 格式的字符串' },
-          body: { type: 'string', description: '请求体的原始字符串内容' }
+          headers: { type: 'string', description: 'JSON 格式字符串' },
+          body: { type: 'string', description: '纯字符串请求体' }
         },
         required: ['url', 'method']
       }
@@ -36,10 +44,7 @@ function createMcpServer() {
       try {
         const parsedHeaders = headers ? JSON.parse(headers) : { 'Content-Type': 'application/json' };
         const options = { method: method.toUpperCase(), headers: parsedHeaders };
-        
-        if (['POST', 'PUT', 'PATCH'].includes(options.method) && body) {
-          options.body = body;
-        }
+        if (['POST', 'PUT', 'PATCH'].includes(options.method) && body) options.body = body;
         
         const response = await fetch(url, options);
         const text = await response.text();
@@ -54,42 +59,45 @@ function createMcpServer() {
   return mcpServer;
 }
 
-// SSE 连接路由
+// 2. 优化连接路径：使用安全的绝对路径，防止客户端丢参
 app.get('/sse', async (req, res) => {
+  console.log('>>> [SSE] 新的连接请求到来');
   try {
     const sessionId = Date.now().toString();
-    const transport = new SSEServerTransport(`/message?sessionId=${sessionId}`, res);
+    const transport = new SSEServerTransport(`/message/${sessionId}`, res);
     transports.set(sessionId, transport);
     
-    const mcpServer = createMcpServer(); // 每次新建实例
+    const mcpServer = createMcpServer();
     await mcpServer.connect(transport);
     
-    req.on('close', () => transports.delete(sessionId));
+    console.log(`>>> [SSE] 握手成功! Session: ${sessionId}`);
+    
+    req.on('close', () => {
+      console.log(`>>> [SSE] 客户端主动断开了连接, Session: ${sessionId}`);
+      transports.delete(sessionId);
+    });
   } catch (e) {
-    console.error('SSE Error:', e);
-    res.status(500).send('Internal Server Error');
+    console.error('>>> [SSE] 致命错误:', e);
+    if (!res.headersSent) res.status(500).send('Error');
   }
 });
 
-// 消息接收路由
-app.post('/message', async (req, res) => {
+app.post('/message/:sessionId', async (req, res) => {
+  console.log(`>>> [POST] 收到工具调用指令, Session: ${req.params.sessionId}`);
   try {
-    const sessionId = req.query.sessionId;
-    const transport = transports.get(sessionId);
+    const transport = transports.get(req.params.sessionId);
     if (!transport) {
+      console.log('>>> [POST] 错误：找不到对应的会话记录');
       return res.status(404).send('Session not found');
     }
     await transport.handlePostMessage(req, res);
   } catch (e) {
-    console.error('Message Error:', e);
+    console.error('>>> [POST] 处理指令出错:', e);
     res.status(500).send('Message Error');
   }
 });
 
-// 健康检查路由（防止云服务探针报错）
-app.get('/', (req, res) => {
-  res.send('MCP Proxy is running. Please connect via /sse');
-});
+app.get('/', (req, res) => res.send('MCP is running'));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));
