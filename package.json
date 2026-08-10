@@ -1,0 +1,12 @@
+{
+  "name": "mcp-proxy",
+  "type": "module",
+  "dependencies": {
+    "express": "latest",
+    "@modelcontextprotocol/sdk": "latest"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
+
